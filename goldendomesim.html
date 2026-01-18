@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Orbital Mechanics: Constellation Intercept</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Courier New', Courier, monospace; color: white; }
+        #canvas-container { width: 100vw; height: 100vh; }
+        
+        #ui-layer {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            pointer-events: none;
+            background: rgba(0, 20, 40, 0.9);
+            padding: 20px;
+            border: 1px solid #4af;
+            border-radius: 8px;
+            box-shadow: 0 0 15px rgba(68, 170, 255, 0.3);
+            max-width: 350px;
+        }
+
+        h1 { margin: 0 0 10px 0; font-size: 18px; color: #4af; text-transform: uppercase; letter-spacing: 2px; }
+        
+        .stat-row { display: flex; justify-content: space-between; margin-bottom: 5px; }
+        .stat-label { color: #88ccee; }
+        .stat-value { font-weight: bold; }
+
+        #controls {
+            margin-top: 15px;
+            pointer-events: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        button {
+            background: #004466;
+            color: white;
+            border: 1px solid #4af;
+            padding: 8px;
+            cursor: pointer;
+            font-family: inherit;
+            text-transform: uppercase;
+            font-weight: bold;
+            transition: all 0.2s;
+        }
+        button:hover { background: #006699; box-shadow: 0 0 10px #4af; }
+        button:disabled { background: #333; border-color: #555; color: #888; cursor: not-allowed; }
+
+        input[type="range"] { width: 100%; cursor: pointer; }
+
+        #readout {
+            margin-top: 15px;
+            padding-top: 10px;
+            border-top: 1px dashed #4af;
+            font-size: 12px;
+            line-height: 1.4;
+        }
+
+        .legend { display: flex; align-items: center; gap: 8px; margin-top: 5px; font-size: 12px; }
+        .dot { width: 8px; height: 8px; border-radius: 50%; }
+        .box { width: 12px; height: 12px; border: 1px solid #4af; background: rgba(0,255,255,0.2); }
+
+        #notification {
+            position: absolute;
+            top: 10%;
+            width: 100%;
+            text-align: center;
+            font-size: 24px;
+            font-weight: bold;
+            text-shadow: 0 0 10px black;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.5s;
+        }
+    </style>
+</head>
+<body>
+
+<div id="ui-layer">
+    <h1>Constellation Defense</h1>
+    
+    <div class="stat-row">
+        <span class="stat-label">Sim Speed:</span>
+        <span class="stat-value" id="speed-val">1x</span>
+    </div>
+    <div class="stat-row">
+        <span class="stat-label">Active Satellites:</span>
+        <span class="stat-value">100</span>
+    </div>
+    <div class="stat-row">
+        <span class="stat-label">Active Solutions:</span>
+        <span class="stat-value" id="intercept-count" style="color:yellow">0</span>
+    </div>
+    <div class="stat-row">
+        <span class="stat-label">Phase:</span>
+        <span class="stat-value" id="flight-phase">--</span>
+    </div>
+
+    <div id="readout">
+        CONSTRAINT: 3.0 Gs Max Accel<br>
+        WINDOW: Boost Phase Only<br>
+        STATUS: MONITORING
+    </div>
+
+    <div id="controls">
+        <label>Time Scale
+            <input type="range" id="time-slider" min="0" max="100" value="10">
+        </label>
+        <button id="btn-launch" onclick="launchMissile()">Launch ICBM</button>
+        <button onclick="resetSim()">Reset Scenario</button>
+    </div>
+
+    <div style="margin-top: 15px; border-top: 1px solid #333; padding-top:10px;">
+        <div class="legend"><div class="dot" style="background:red;"></div> ICBM (Active Threat)</div>
+        <div class="legend"><div class="dot" style="background:cyan;"></div> Satellite</div>
+        <div class="legend"><div class="dot" style="background:yellow; box-shadow: 0 0 5px yellow;"></div> Valid 3G Intercept</div>
+    </div>
+</div>
+
+<div id="notification"></div>
+<div id="canvas-container"></div>
+
+<!-- Three.js CDN -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<!-- OrbitControls -->
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+
+<script>
+    // --- Configuration Constants ---
+    const EARTH_RADIUS = 63.71; 
+    const SAT_ALTITUDE = 5.0;   
+    const SAT_RADIUS = EARTH_RADIUS + SAT_ALTITUDE;
+    
+    const NUM_SATELLITES = 100;
+    const INCLINATION = 75 * (Math.PI/180);
+    
+    // Physics Configuration
+    // Max acceleration: 3 Gs
+    // We need to scale this to simulation units.
+    // Sim Unit = 100km = 100,000m.
+    // 3 Gs = 30 m/s^2.
+    // Time Compression: The sim runs fast. 
+    // Let's derive a playable value that represents "Difficulty".
+    // A value of 25 in sim units works well to represent "High thrust but not teleportation" at this time scale.
+    const ACCEL_LIMIT = 25.0; 
+    
+    const BOOST_PHASE_END = 0.15; // 15% of path
+    const MISSILE_SPEED_RATE = 0.15; // Progress per second (approx)
+
+    // --- Scene Setup ---
+    const container = document.getElementById('canvas-container');
+    const scene = new THREE.Scene();
+    
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 3000);
+    camera.position.set(140, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    container.appendChild(renderer.domElement);
+
+    const controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enablePan = false;
+    controls.minDistance = 80;
+    controls.maxDistance = 400;
+    controls.autoRotate = true;
+    controls.autoRotateSpeed = 0.5;
+
+    const ambientLight = new THREE.AmbientLight(0x333333);
+    scene.add(ambientLight);
+    const sunLight = new THREE.DirectionalLight(0xffffff, 1.2);
+    sunLight.position.set(100, 50, 100);
+    scene.add(sunLight);
+    
+    // Stars
+    const starGeometry = new THREE.BufferGeometry();
+    const starMaterial = new THREE.PointsMaterial({color: 0xffffff, size: 0.2});
+    const starVertices = [];
+    for(let i=0; i<3000; i++) {
+        starVertices.push((Math.random()-0.5)*2000, (Math.random()-0.5)*2000, (Math.random()-0.5)*2000);
+    }
+    starGeometry.setAttribute('position', new THREE.Float32BufferAttribute(starVertices, 3));
+    scene.add(new THREE.Points(starGeometry, starMaterial));
+
+    // --- Earth ---
+    const earthGroup = new THREE.Group();
+    scene.add(earthGroup);
+
+    const textureLoader = new THREE.TextureLoader();
+    const earthMesh = new THREE.Mesh(
+        new THREE.SphereGeometry(EARTH_RADIUS, 64, 64),
+        new THREE.MeshPhongMaterial({ color: 0x112244, emissive: 0x000510, shininess: 5, transparent: true, opacity: 0.95 })
+    );
+    earthGroup.add(earthMesh);
+    
+    const earthWire = new THREE.Mesh(
+        new THREE.SphereGeometry(EARTH_RADIUS + 0.1, 32, 32),
+        new THREE.MeshBasicMaterial({ color: 0x336699, wireframe: true, transparent: true, opacity: 0.1 })
+    );
+    earthGroup.add(earthWire);
+
+    textureLoader.load('https://upload.wikimedia.org/wikipedia/commons/8/83/Equirectangular_projection_SW.jpg', (tex) => {
+        earthMesh.material.map = tex;
+        earthMesh.material.color.setHex(0xffffff); 
+        earthMesh.material.needsUpdate = true;
+    });
+
+    // --- Helper Functions ---
+    function latLonToVector3(lat, lon, radius) {
+        const phi = (90 - lat) * (Math.PI / 180);
+        const theta = (lon + 180) * (Math.PI / 180);
+        const x = -(radius * Math.sin(phi) * Math.cos(theta));
+        const z = (radius * Math.sin(phi) * Math.sin(theta));
+        const y = (radius * Math.cos(phi));
+        return new THREE.Vector3(x, y, z);
+    }
+
+    // --- Satellites ---
+    const satellites = [];
+    const satGeometry = new THREE.BoxGeometry(0.8, 0.3, 0.3);
+    const satMaterial = new THREE.MeshBasicMaterial({ color: 0x00ffff });
+    
+    const interceptGeo = new THREE.SphereGeometry(1, 16, 16);
+    const interceptMat = new THREE.MeshBasicMaterial({ color: 0xffff00, wireframe: true, transparent: true, opacity: 0.5 });
+
+    // Walker Constellation Setup
+    // 100 Satellites = 10 Planes of 10 Satellites
+    const NUM_PLANES = 10;
+    const SATS_PER_PLANE = NUM_SATELLITES / NUM_PLANES;
+
+    for(let p = 0; p < NUM_PLANES; p++) {
+        for(let s = 0; s < SATS_PER_PLANE; s++) {
+            const sat = {
+                mesh: new THREE.Mesh(satGeometry, satMaterial.clone()),
+                interceptMesh: new THREE.Mesh(interceptGeo, interceptMat),
+                // Angle (Mean Anomaly): Evenly spaced in the ring
+                // We add a phase shift (p * offset) so satellites in adjacent planes are staggered
+                angle: (s / SATS_PER_PLANE) * Math.PI * 2 + (p * 0.3), 
+                // RAAN: Evenly spaced rings around the equator
+                raan: (p / NUM_PLANES) * Math.PI * 2,  
+                speedOffset: 1.0 // Uniform speed to maintain formation
+            };
+            
+            sat.interceptMesh.visible = false;
+            scene.add(sat.mesh);
+            sat.mesh.add(sat.interceptMesh);
+            satellites.push(sat);
+        }
+    }
+
+    // --- Missile ---
+    const launchLat = 62.9, launchLon = 40.5; 
+    const targetLat = 38.9, targetLon = -77.0; 
+    
+    const launchPos = latLonToVector3(launchLat, launchLon, EARTH_RADIUS);
+    const targetPos = latLonToVector3(targetLat, targetLon, EARTH_RADIUS);
+    
+    const sGeo = new THREE.SphereGeometry(0.5);
+    const lMark = new THREE.Mesh(sGeo, new THREE.MeshBasicMaterial({color:0xff0000}));
+    lMark.position.copy(launchPos);
+    earthGroup.add(lMark);
+    
+    const tMark = new THREE.Mesh(sGeo, new THREE.MeshBasicMaterial({color:0x00ff00}));
+    tMark.position.copy(targetPos);
+    earthGroup.add(tMark);
+
+    const arcHeight = 35; 
+    const controlPoint = launchPos.clone().add(targetPos).multiplyScalar(0.5).normalize().multiplyScalar(EARTH_RADIUS + arcHeight);
+    const missileCurve = new THREE.QuadraticBezierCurve3(launchPos, controlPoint, targetPos);
+    
+    const missileMesh = new THREE.Mesh(
+        new THREE.ConeGeometry(0.5, 1.5, 8),
+        new THREE.MeshStandardMaterial({ color: 0xff0000, emissive: 0xff0000, emissiveIntensity: 0.5 })
+    );
+    missileMesh.visible = false;
+    earthGroup.add(missileMesh);
+
+    // --- Simulation State ---
+    let missileActive = false;
+    let missileProgress = 0;
+    let lastTime = Date.now();
+    
+    const uiSpeed = document.getElementById('speed-val');
+    const uiCount = document.getElementById('intercept-count');
+    const uiPhase = document.getElementById('flight-phase');
+    const uiReadout = document.getElementById('readout');
+    const slider = document.getElementById('time-slider');
+    const notif = document.getElementById('notification');
+
+    function launchMissile() {
+        if(missileActive) return;
+        missileActive = true;
+        missileProgress = 0;
+        missileMesh.visible = true;
+        document.getElementById('btn-launch').disabled = true;
+        uiReadout.innerHTML = "THREAT DETECTED<br>TRACKING...";
+        notif.innerText = "LAUNCH DETECTED";
+        notif.style.color = "red";
+        notif.style.opacity = 1;
+        setTimeout(() => notif.style.opacity = 0, 2000);
+    }
+
+    function resetSim() {
+        missileActive = false;
+        missileMesh.visible = false;
+        missileProgress = 0;
+        document.getElementById('btn-launch').disabled = false;
+        uiReadout.innerHTML = "STATUS: STANDBY";
+        uiPhase.innerText = "--";
+        uiCount.innerText = "0";
+        uiCount.style.color = "yellow";
+        satellites.forEach(s => {
+            s.interceptMesh.visible = false;
+            s.mesh.material.color.setHex(0x00ffff);
+        });
+    }
+
+    function updatePhysics(dt) {
+        // Earth Rotation
+        earthGroup.rotation.y += 0.02 * dt;
+
+        let validIntercepts = 0;
+        let isBoostPhase = false;
+        
+        // Target Point Calculation
+        // We aim for the position of the missile at the END of the boost phase.
+        // If we can't get there by then, it's a fail (missile releases MIRVs).
+        const missileBoostEndLocal = missileCurve.getPoint(BOOST_PHASE_END);
+        const missileBoostEndWorld = missileBoostEndLocal.clone().applyMatrix4(earthGroup.matrixWorld);
+
+        if (missileActive) {
+            isBoostPhase = missileProgress < BOOST_PHASE_END;
+            
+            if(isBoostPhase) {
+                uiPhase.innerText = "BOOST PHASE";
+                uiPhase.style.color = "#ff4444";
+                
+                // --- Intercept Logic ---
+                
+                // 1. Time Remaining in Boost Phase (seconds)
+                // rate = 0.15 prog/sec (approx)
+                const progRemaining = BOOST_PHASE_END - missileProgress;
+                const timeRemaining = progRemaining / MISSILE_SPEED_RATE; // seconds
+                
+                // 2. Max Distance Coverable with 3Gs
+                // d = 0.5 * a * t^2
+                // This assumes we start burning towards the target immediately
+                const maxCoverableDist = 0.5 * ACCEL_LIMIT * (timeRemaining * timeRemaining);
+
+                satellites.forEach(sat => {
+                    // Update Sat Position
+                    sat.angle += dt * 0.5 * sat.speedOffset;
+                    const cx = SAT_RADIUS * Math.cos(sat.angle);
+                    const cy = SAT_RADIUS * Math.sin(sat.angle);
+                    const v = new THREE.Vector3(cx, 0, cy);
+                    v.applyAxisAngle(new THREE.Vector3(1,0,0), INCLINATION);
+                    v.applyAxisAngle(new THREE.Vector3(0,1,0), sat.raan);
+                    sat.mesh.position.copy(v);
+                    sat.mesh.lookAt(new THREE.Vector3(0,0,0));
+
+                    sat.interceptMesh.visible = false;
+                    sat.mesh.material.color.setHex(0x00ffff);
+
+                    // --- The Check ---
+                    // Where will the satellite be (naturally) at the end of boost phase?
+                    // We project its orbit forward by timeRemaining.
+                    const orbitSpeedRad = 0.5 * sat.speedOffset; // radians per sec
+                    const futureAngle = sat.angle + (orbitSpeedRad * timeRemaining);
+                    
+                    const fx = SAT_RADIUS * Math.cos(futureAngle);
+                    const fy = SAT_RADIUS * Math.sin(futureAngle);
+                    const futureV = new THREE.Vector3(fx, 0, fy);
+                    futureV.applyAxisAngle(new THREE.Vector3(1,0,0), INCLINATION);
+                    futureV.applyAxisAngle(new THREE.Vector3(0,1,0), sat.raan);
+                    
+                    // Distance gap we need to bridge using thrust
+                    const gap = futureV.distanceTo(missileBoostEndWorld);
+
+                    // If our thrusters can cover this gap in the time remaining
+                    if (gap < maxCoverableDist) {
+                        sat.interceptMesh.visible = true;
+                        sat.mesh.material.color.setHex(0xffff00);
+                        validIntercepts++;
+                    }
+                });
+            } else {
+                uiPhase.innerText = "MIDCOURSE (TOO LATE)";
+                uiPhase.style.color = "#888";
+                // Still update sat positions
+                satellites.forEach(sat => {
+                    sat.angle += dt * 0.5 * sat.speedOffset;
+                    const cx = SAT_RADIUS * Math.cos(sat.angle);
+                    const cy = SAT_RADIUS * Math.sin(sat.angle);
+                    const v = new THREE.Vector3(cx, 0, cy);
+                    v.applyAxisAngle(new THREE.Vector3(1,0,0), INCLINATION);
+                    v.applyAxisAngle(new THREE.Vector3(0,1,0), sat.raan);
+                    sat.mesh.position.copy(v);
+                    sat.mesh.lookAt(new THREE.Vector3(0,0,0));
+                    sat.interceptMesh.visible = false;
+                });
+            }
+        } else {
+            // Idle rotation for sats
+             satellites.forEach(sat => {
+                sat.angle += dt * 0.5 * sat.speedOffset;
+                const cx = SAT_RADIUS * Math.cos(sat.angle);
+                const cy = SAT_RADIUS * Math.sin(sat.angle);
+                const v = new THREE.Vector3(cx, 0, cy);
+                v.applyAxisAngle(new THREE.Vector3(1,0,0), INCLINATION);
+                v.applyAxisAngle(new THREE.Vector3(0,1,0), sat.raan);
+                sat.mesh.position.copy(v);
+                sat.mesh.lookAt(new THREE.Vector3(0,0,0));
+            });
+            uiPhase.innerText = "--";
+        }
+
+        uiCount.innerText = validIntercepts;
+        if (validIntercepts > 0) uiCount.style.color = "#44ff44";
+        else uiCount.style.color = "yellow";
+
+        // Missile Visuals
+        if (missileActive) {
+            missileProgress += dt * MISSILE_SPEED_RATE;
+            
+            if (missileProgress >= 1) {
+                missileProgress = 1;
+                missileActive = false;
+                const imp = new THREE.Mesh(new THREE.SphereGeometry(3), new THREE.MeshBasicMaterial({color:0xff0000}));
+                imp.position.copy(targetPos);
+                earthGroup.add(imp);
+                setTimeout(()=>earthGroup.remove(imp), 1000);
+                notif.innerText = "IMPACT CONFIRMED";
+                notif.style.color = "red";
+                notif.style.opacity = 1;
+            }
+            
+            const localPos = missileCurve.getPoint(missileProgress);
+            missileMesh.position.copy(localPos);
+            const nextPos = missileCurve.getPoint(Math.min(missileProgress + 0.01, 1));
+            missileMesh.lookAt(nextPos);
+            missileMesh.rotateX(Math.PI/2);
+        }
+    }
+
+    function animate() {
+        requestAnimationFrame(animate);
+        const now = Date.now();
+        const rawDt = Math.min((now - lastTime) / 1000, 0.1);
+        lastTime = now;
+        
+        const timeScale = parseFloat(slider.value) / 10;
+        uiSpeed.innerText = timeScale.toFixed(1) + "x";
+
+        controls.update();
+        // Pass scaled time to physics
+        updatePhysics(rawDt * timeScale);
+        renderer.render(scene, camera);
+    }
+    
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    animate();
+
+</script>
+</body>
+</html>
